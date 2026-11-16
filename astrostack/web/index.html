@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>天文短曝光融合 · astrostack</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>天文短曝光融合</h1>
+  <span class="sub">平移估计 · 亚像素配准 · 加权融合（原生分辨率加权平均，非超分辨率）</span>
+</header>
+
+<div id="layout">
+  <aside id="left">
+    <section class="panel">
+      <h2>曝光组</h2>
+      <div class="row">
+        <button id="btn-demo">生成示例曝光组</button>
+        <label class="upload">载入曝光组
+          <input type="file" id="file-input" multiple
+                 accept=".npy,.fits,.fit,.fts,.png,.jpg,.jpeg,.tif,.tiff">
+        </label>
+      </div>
+      <div id="frame-list" class="frame-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>操作</h2>
+      <button id="btn-restimate" disabled>按当前参考帧重新估计</button>
+      <button id="btn-stack" disabled>执行融合</button>
+      <div id="stale" class="stale hidden">参数已修改，融合结果已过期，请重新融合</div>
+    </section>
+
+    <section class="panel">
+      <h2>异常提示</h2>
+      <div id="anomalies" class="anomalies">（无）</div>
+    </section>
+
+    <section class="panel">
+      <h2>下载（浮点科学数据）</h2>
+      <div class="row wrap" id="downloads">
+        <a href="/api/download/fused-npy" download>fused.npy</a>
+        <a href="/api/download/fused-fits" download>fused.fits</a>
+        <a href="/api/download/coverage-npy" download>coverage.npy</a>
+        <a href="/api/download/report-json" download>report.json</a>
+      </div>
+    </section>
+  </aside>
+
+  <main id="center">
+    <section class="panel">
+      <div class="row">
+        <label>视图
+          <select id="view">
+            <option value="fused">融合图</option>
+            <option value="coverage">覆盖图</option>
+            <option value="frame">单帧</option>
+            <option value="residual">残差（帧−融合）</option>
+            <option value="footprint">帧覆盖足迹</option>
+          </select>
+        </label>
+        <label id="frame-picker-wrap">帧 <select id="frame-picker"></select></label>
+        <label>拉伸低 <input type="number" id="lo" value="1" step="0.5" min="0" max="99">%</label>
+        <label>拉伸高 <input type="number" id="hi" value="99" step="0.5" min="1" max="100">%</label>
+        <label><input type="checkbox" id="logstretch"> 对数</label>
+      </div>
+      <div class="hint">拉伸仅作用于本显示，不写回科学数据；下载的浮点数据不受影响。</div>
+      <div class="img-wrap"><img id="main-img" alt="主视图"></div>
+    </section>
+
+    <section class="panel">
+      <h2>星点细节（实测）</h2>
+      <div class="row">
+        <canvas id="cutout" width="300" height="300"></canvas>
+        <div id="star-info" class="mono"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>配准残差（实测）</h2>
+      <div class="row">
+        <canvas id="shift-plot" width="320" height="240"></canvas>
+        <div class="scroll"><table id="resid-table"></table></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
