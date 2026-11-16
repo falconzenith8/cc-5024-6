@@ -36,11 +36,12 @@ class StackResult:
 
 
 def stack_frames(frames, estimates, enabled=None, weights=None,
-                 keep_aligned=True):
+                 keep_aligned=True, progress_cb=None, is_cancelled=None):
     """frames: 帧序列；estimates: estimate_shifts 的结果。
 
     enabled: 可选布尔序列，用户逐帧开关；ok=False 的帧无论开关都不参与。
     weights: 可选每帧标量权重覆盖（None 用估计给出的默认权重）。
+    progress_cb(fraction) / is_cancelled() 为离线任务的可选钩子。
     """
     n = len(frames)
     if enabled is None:
@@ -54,11 +55,17 @@ def stack_frames(frames, estimates, enabled=None, weights=None,
     used, aligned, footprints = [], {}, {}
 
     for k in range(n):
+        if is_cancelled is not None and is_cancelled():
+            raise RuntimeError("任务已取消")
         est = estimates[k]
         if not enabled[k] or not est.ok:
+            if progress_cb is not None:
+                progress_cb((k + 1) / n)
             continue
         w_k = float(weights[k])
         if not np.isfinite(w_k) or w_k <= 0:
+            if progress_cb is not None:
+                progress_cb((k + 1) / n)
             continue
         a, c = shift_bilinear(frames[k], est.dx, est.dy)
         eff = w_k * c
@@ -74,6 +81,8 @@ def stack_frames(frames, estimates, enabled=None, weights=None,
         if keep_aligned:
             aligned[k] = a
             footprints[k] = c
+        if progress_cb is not None:
+            progress_cb((k + 1) / n)
 
     if acc is None:
         raise ValueError("没有可参与叠加的帧（全部被剔除或禁用）")

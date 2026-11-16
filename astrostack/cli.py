@@ -3,18 +3,25 @@
 用法：
   python3 -m astrostack.cli simulate --out data/demo [--n 16]
   python3 -m astrostack.cli run --frames "data/demo/frame_*.npy" --out data/out
+  python3 -m astrostack.cli offline run    --job-dir runs/demo --frames "data/demo/frame_*.npy"
+  python3 -m astrostack.cli offline status --job-dir runs/demo
+  python3 -m astrostack.cli offline cancel --job-dir runs/demo
+  python3 -m astrostack.cli offline resume --job-dir runs/demo
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
 from . import io
+from .offline import (STATUS_CANCELLED, STATUS_FAILED, STATUS_SUCCEEDED,
+                      JobConfig, OfflineJob)
 from .pipeline import run_pipeline
 from .simulate import SimConfig, make_sequence
 
@@ -49,7 +56,6 @@ def cmd_run(args):
     truth_star = None
     truth_json = Path(files[0]).parent / "truth.json"
     if truth_json.exists():
-        import json
         meta = json.loads(truth_json.read_text())
         truth_shifts = np.array(meta["shifts"])
         from .simulate import Star
@@ -86,8 +92,59 @@ def cmd_run(args):
         print(f"能量误差: {en['rel_error'] * 100:+.2f}%  "
               f"(FWHM 真值 {en['fwhm_truth']:.3f}px)")
     for a in report["anomalies"]:
-        print("异常提示:", a)
+        msg = a["message"] if isinstance(a, dict) else a
+        print("异常提示:", msg)
     print(f"输出: {out}/fused.npy, coverage.npy, fused.fits, report.json")
+
+
+def _print_job_footer(state, job):
+    print(f"任务状态: {state['status']}（阶段 {state.get('stage')}，"
+          f"进度 {state.get('progress', 0) * 100:.0f}%）")
+    if state["status"] == STATUS_SUCCEEDED:
+        ev = json.loads(job.evidence_path.read_text())
+        snr = ev["output_snr"]
+        ms = ev["frame_manifest_summary"]
+        print(f"输出信噪比: 孔径 SNR={snr['snr_aperture']:.2f} "
+              f"峰值 SNR={snr['snr_peak']:.2f}")
+        print(f"帧清单: 共 {ms['n_frames']} 帧，参与 {ms['n_used']}，"
+              f"门控剔除 {ms['n_gated']}，坏输入 {ms['n_bad_input']}")
+        print(f"产物目录: {job.out_dir}")
+    elif state["status"] in (STATUS_FAILED, STATUS_CANCELLED):
+        if job.error_path.exists():
+            err = json.loads(job.error_path.read_text())
+            print(f"退出信息: [{err['error_type']}] {err['error']}")
+        print(f"必要输入保留在: {job.inputs_dir}")
+
+
+def cmd_offline(args):
+    if args.offline_cmd == "run":
+        cfg = JobConfig(
+            job_dir=args.job_dir, frames_glob=args.frames, reference=args.ref,
+            requirements=args.requirements, threads=args.threads,
+            truth_json=args.truth_json, name=args.name)
+        job = OfflineJob.create(cfg)
+        state = job.run()
+        _print_job_footer(state, job)
+        sys.exit({STATUS_SUCCEEDED: 0, STATUS_CANCELLED: 130,
+                  STATUS_FAILED: 1}[state["status"]])
+    job = OfflineJob(args.job_dir)
+    if args.offline_cmd == "status":
+        state = job._read_state()
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        if job.evidence_path.exists():
+            print("--- evidence.json ---")
+            print(job.evidence_path.read_text())
+        sys.exit(0 if state["status"] == STATUS_SUCCEEDED else 1)
+    if args.offline_cmd == "cancel":
+        job.request_cancel()
+        print(f"已写入 {job.cancel_path}；运行中的任务会在阶段/帧边界退出")
+        sys.exit(0)
+    if args.offline_cmd == "resume":
+        state = job.run()
+        _print_job_footer(state, job)
+        sys.exit({STATUS_SUCCEEDED: 0, STATUS_CANCELLED: 130,
+                  STATUS_FAILED: 1}[state["status"]])
+    sys.exit(2)
 
 
 def main(argv=None):
@@ -107,6 +164,31 @@ def main(argv=None):
     p.add_argument("--ref", type=int, default=0, help="参考帧索引")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("offline", help="可恢复离线任务（run/status/cancel/resume）")
+    osub = p.add_subparsers(dest="offline_cmd", required=True)
+
+    pr = osub.add_parser("run", help="创建并执行离线任务")
+    pr.add_argument("--job-dir", required=True)
+    pr.add_argument("--frames", required=True)
+    pr.add_argument("--ref", type=int, default=0)
+    pr.add_argument("--requirements", default="requirements.txt")
+    pr.add_argument("--threads", type=int, default=1)
+    pr.add_argument("--truth-json", default=None)
+    pr.add_argument("--name", default="offline-job")
+    pr.set_defaults(fn=cmd_offline)
+
+    ps = osub.add_parser("status", help="查看任务状态与执行证据")
+    ps.add_argument("--job-dir", required=True)
+    ps.set_defaults(fn=cmd_offline)
+
+    pc = osub.add_parser("cancel", help="请求取消运行中的任务")
+    pc.add_argument("--job-dir", required=True)
+    pc.set_defaults(fn=cmd_offline)
+
+    pm = osub.add_parser("resume", help="恢复（或重试）离线任务")
+    pm.add_argument("--job-dir", required=True)
+    pm.set_defaults(fn=cmd_offline)
 
     args = ap.parse_args(argv)
     args.fn(args)

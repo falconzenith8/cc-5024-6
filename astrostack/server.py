@@ -15,6 +15,9 @@ from __future__ import annotations
 import argparse
 import io as _io
 import json
+import threading
+import time
+from pathlib import Path
 
 import numpy as np
 from flask import Flask, request, send_file
@@ -22,11 +25,15 @@ from PIL import Image
 
 from . import io as aio
 from .estimate import GateConfig, estimate_shifts
+from .offline import STATUS_SUCCEEDED, JobConfig, OfflineJob
 from .pipeline import run_pipeline
 from .simulate import SimConfig, make_sequence
 from .stack import frame_residuals
 
 app = Flask(__name__, static_folder="web", static_url_path="/static")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OFFLINE_JOBS_ROOT = REPO_ROOT / "runs" / "web"
 
 
 def _sanitize(o):
@@ -60,6 +67,10 @@ STATE = {
     "stack_key": None,     # (ref, enabled, weights) 用于判断结果是否过期
     "group_id": 0,         # 每载入一组曝光自增，客户端据此重置逐帧开关
 }
+
+# 图像处理页发起的离线任务：job_id -> {thread, dir, started_at}
+WEB_JOBS = {}
+WEB_JOBS_LOCK = threading.Lock()
 
 
 # ---------------- 工具 ----------------
@@ -326,6 +337,148 @@ def api_download(kind):
         return safe_jsonify({"error": "未知类型"}), 404
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=name)
+
+
+# ---------------- 离线任务（图像处理页内交互，非 CLI） ----------------
+
+def _job_snapshot(job_id, job_dir):
+    state_path = Path(job_dir) / "state.json"
+    if not state_path.exists():
+        return {"job_id": job_id, "status": "unknown"}
+    snap = json.loads(state_path.read_text())
+    snap["job_id"] = job_id
+    err_path = Path(job_dir) / "error.json"
+    if err_path.exists():
+        snap["error_detail"] = json.loads(err_path.read_text())
+    ev_path = Path(job_dir) / "evidence.json"
+    if ev_path.exists():
+        snap["evidence"] = json.loads(ev_path.read_text())
+    with WEB_JOBS_LOCK:
+        info = WEB_JOBS.get(job_id)
+        snap["alive"] = bool(info and info["thread"].is_alive())
+    return snap
+
+
+def _stage_web_frames(job_id):
+    """把当前会话已载入的曝光组落盘为任务输入，返回 (frames_glob, truth_json)。"""
+    if not STATE["frames"]:
+        raise RuntimeError("尚未载入曝光组，无法发起离线任务")
+    job_dir = OFFLINE_JOBS_ROOT / job_id
+    src_dir = job_dir / "source_frames"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    for i, frame in enumerate(STATE["frames"]):
+        aio.save_npy(src_dir / f"frame_{i:03d}.npy", frame)
+    truth_json = None
+    if STATE["truth_shifts"] is not None and STATE["truth_star"] is not None:
+        meta = {
+            "shifts": np.asarray(STATE["truth_shifts"]).tolist(),
+            "stars": [dict(x0=STATE["truth_star"].x0, y0=STATE["truth_star"].y0,
+                           peak=STATE["truth_star"].peak,
+                           sigma=STATE["truth_star"].sigma)],
+        }
+        tj = src_dir / "truth.json"
+        tj.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        truth_json = str(tj)
+    return str(src_dir / "frame_*.npy"), truth_json
+
+
+def _load_job_into_state(job):
+    """任务成功后把真实产物载入会话，使页面各视图展示本次离线结果。"""
+    out = Path(job.dir) / "outputs"
+    fused = aio.load_npy(out / "fused.npy")
+    coverage = aio.load_npy(out / "coverage.npy")
+    weight_sum = aio.load_npy(out / "weight_sum.npy")
+    report = json.loads((out / "report.json").read_text())
+    used = report["used"]
+    from .stack import StackResult
+
+    STATE["stack"] = StackResult(fused=fused, coverage=coverage,
+                                 weight_sum=weight_sum, used=used,
+                                 aligned={}, footprints={})
+    STATE["report"] = report
+    # 补算对齐图供残差视图使用
+    if STATE["estimates"] is not None and STATE["frames"] is not None:
+        from .resample import shift_bilinear
+        for k in used:
+            if k < len(STATE["frames"]) and k < len(STATE["estimates"]):
+                a, c = shift_bilinear(STATE["frames"][k],
+                                      STATE["estimates"][k].dx,
+                                      STATE["estimates"][k].dy)
+                STATE["stack"].aligned[k] = a
+                STATE["stack"].footprints[k] = c
+    STATE["stack_key"] = ("offline", job.dir)
+
+
+def _run_web_job(job_id, cfg):
+    job = OfflineJob.create(cfg)
+    state = job.run()
+    if state["status"] == STATUS_SUCCEEDED:
+        # 仅当会话仍是同一曝光组时载入，避免覆盖用户后续操作
+        _load_job_into_state(job)
+
+
+@app.post("/api/offline/start")
+def api_offline_start():
+    body = request.get_json(force=True) or {}
+    with WEB_JOBS_LOCK:
+        for jid, info in WEB_JOBS.items():
+            if info["thread"].is_alive():
+                return safe_jsonify(
+                    {"error": f"已有离线任务 {jid} 在运行，请先取消或等待完成"}), 409
+    job_id = time.strftime("webjob-%Y%m%d-%H%M%S")
+    job_dir = OFFLINE_JOBS_ROOT / job_id
+    try:
+        frames_glob, truth_json = _stage_web_frames(job_id)
+    except RuntimeError as exc:
+        return safe_jsonify({"error": str(exc)}), 400
+    cfg = JobConfig(
+        job_dir=str(job_dir), frames_glob=frames_glob,
+        reference=int(body.get("reference", STATE["reference"])),
+        requirements=str(REPO_ROOT / "requirements.txt"),
+        threads=1, truth_json=truth_json, name=job_id)
+    t = threading.Thread(target=_run_web_job, args=(job_id, cfg),
+                         name=job_id, daemon=True)
+    with WEB_JOBS_LOCK:
+        WEB_JOBS[job_id] = {"thread": t, "dir": str(job_dir),
+                            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    t.start()
+    return safe_jsonify({"job_id": job_id, **_job_snapshot(job_id, job_dir)})
+
+
+@app.get("/api/offline/status/<job_id>")
+def api_offline_status(job_id):
+    job_dir = OFFLINE_JOBS_ROOT / job_id
+    if not job_dir.exists():
+        return safe_jsonify({"error": "任务不存在"}), 404
+    return safe_jsonify(_job_snapshot(job_id, job_dir))
+
+
+@app.post("/api/offline/cancel/<job_id>")
+def api_offline_cancel(job_id):
+    job_dir = OFFLINE_JOBS_ROOT / job_id
+    if not job_dir.exists():
+        return safe_jsonify({"error": "任务不存在"}), 404
+    OfflineJob(job_dir).request_cancel()
+    return safe_jsonify(_job_snapshot(job_id, job_dir))
+
+
+@app.post("/api/offline/resume/<job_id>")
+def api_offline_resume(job_id):
+    job_dir = OFFLINE_JOBS_ROOT / job_id
+    if not (job_dir / "config.json").exists():
+        return safe_jsonify({"error": "任务不存在"}), 404
+    with WEB_JOBS_LOCK:
+        for jid, info in WEB_JOBS.items():
+            if info["thread"].is_alive():
+                return safe_jsonify({"error": f"任务 {jid} 正在运行"}), 409
+    cfg = JobConfig.from_json(json.loads((job_dir / "config.json").read_text()))
+    t = threading.Thread(target=_run_web_job, args=(job_id, cfg),
+                         name=job_id, daemon=True)
+    with WEB_JOBS_LOCK:
+        WEB_JOBS[job_id] = {"thread": t, "dir": str(job_dir),
+                            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    t.start()
+    return safe_jsonify({"job_id": job_id, **_job_snapshot(job_id, job_dir)})
 
 
 def main():

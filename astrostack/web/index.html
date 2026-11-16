@@ -33,7 +33,19 @@
     </section>
 
     <section class="panel">
-      <h2>异常提示</h2>
+      <h2>离线任务（本页交互）</h2>
+      <div class="row wrap">
+        <button id="btn-offline-start" disabled>把当前曝光组作为离线任务运行</button>
+        <button id="btn-offline-cancel" disabled>取消任务</button>
+        <button id="btn-offline-resume" disabled>恢复任务</button>
+      </div>
+      <div id="offline-status" class="mono offline-status">尚未发起离线任务</div>
+      <div class="hint">任务在服务端后台执行，状态来自任务目录 state.json；
+        成功后产物自动载入本页，取消/失败会保留输入与退出信息。</div>
+    </section>
+
+    <section class="panel">
+      <h2>异常提示（按星点细节/配准残差分类）</h2>
       <div id="anomalies" class="anomalies">（无）</div>
     </section>
 

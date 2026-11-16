@@ -1,0 +1,6 @@
+# 离线计算发布的数值依赖锁定版本；离线任务启动时会逐项核对实际安装版本，
+# 不一致即拒绝运行（见 astrostack/offline.py::verify_dependency_lock）。
+numpy==2.1.3
+scipy==1.14.1
+flask==3.0.3
+pillow==11.0.0

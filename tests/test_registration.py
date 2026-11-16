@@ -105,7 +105,9 @@ def test_frame_rejection():
           f"剔除={sorted(rejected)} 期望包含={sorted(sim['bad_frames'])}")
     check("被剔除帧未参与叠加", not (sim["bad_frames"] & set(res.used)),
           f"参与={res.used}")
-    check("剔除原因写入报告", any("剔除" in a for a in report["anomalies"]),
+    check("剔除原因写入报告",
+          any("剔除" in (a["message"] if isinstance(a, dict) else a)
+              for a in report["anomalies"]),
           f"anomalies={report['anomalies']}")
 
 

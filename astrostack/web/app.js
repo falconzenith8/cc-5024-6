@@ -7,6 +7,8 @@ let enabled = [];                 // 用户逐帧开关
 let weightOverride = [];          // 用户逐帧权重覆盖（null=默认）
 let view = "fused";
 let pickFrame = 0;
+let offlineJobId = null;          // 当前离线任务 id
+let offlinePoll = null;           // 轮询计时器
 
 const $ = (id) => document.getElementById(id);
 
@@ -37,6 +39,7 @@ async function refresh() {
   renderResults();
   $("btn-restimate").disabled = !S.n_frames;
   $("btn-stack").disabled = !S.has_estimates;
+  $("btn-offline-start").disabled = !S.n_frames;
   $("stale").classList.toggle("hidden", !(S.has_estimates && !S.has_stack && S.n_frames));
 }
 
@@ -105,10 +108,33 @@ async function changeReference(i) {
   await refresh();
 }
 
+const KIND_LABEL = {
+  star: "星点细节",
+  registration: "配准残差",
+  coverage: "覆盖/权重",
+};
+
+function anomalyText(a) {
+  return typeof a === "string" ? { kind: "coverage", message: a } : a;
+}
+
 function renderAnomalies() {
   const el = $("anomalies");
-  const a = (S.report && S.report.anomalies) || [];
-  el.textContent = a.length ? a.join("\n") : "（无）";
+  const list = (S.report && S.report.anomalies) || [];
+  if (!list.length) { el.innerHTML = "（无）"; return; }
+  el.innerHTML = "";
+  for (const raw of list) {
+    const a = anomalyText(raw);
+    const div = document.createElement("div");
+    div.className = `anomaly anomaly-${a.kind}`;
+    const tag = document.createElement("span");
+    tag.className = "anomaly-tag";
+    tag.textContent = KIND_LABEL[a.kind] || a.kind;
+    const msg = document.createElement("span");
+    msg.textContent = a.message;
+    div.append(tag, msg);
+    el.append(div);
+  }
 }
 
 function renderResults() {
@@ -152,6 +178,12 @@ async function renderStarDetail() {
     + `  拟合残差RMS: ${fmt(p.residual_rms, 2)} adu\n`;
   if (S.report.energy)
     txt += `  能量误差  : ${fmt(S.report.energy.rel_error * 100, 2)} %（相对模拟真值）\n`;
+  const snr = S.report.output_snr;
+  if (snr)
+    txt += `  输出信噪比: 孔径 SNR=${fmt(snr.snr_aperture, 2)} `
+      + `峰值 SNR=${fmt(snr.snr_peak, 2)}（融合图实测，背景σ=${fmt(snr.sigma_bg, 2)}）\n`;
+  else
+    txt += `  输出信噪比: 无法实测（异常区已标出）\n`;
   txt += `\n覆盖: 最大 ${S.report.coverage_stats.max} 帧, `
     + `无覆盖像素占比 ${fmt(S.report.coverage_stats.nan_fraction * 100, 1)}%`;
   info.textContent = txt;
@@ -193,15 +225,25 @@ function renderResiduals() {
   ctx.fillStyle = "#0d0f13";
   ctx.fillRect(0, 0, cv.width, cv.height);
   if (!S.has_estimates) { tbl.innerHTML = ""; return; }
+  const anomalyIdx = new Set();
+  for (const raw of ((S.report && S.report.anomalies) || [])) {
+    const a = anomalyText(raw);
+    const m = a.message.match(/帧\s*(\d+)/);
+    if (m && (a.kind === "registration" || a.kind === "star"))
+      anomalyIdx.add(+m[1]);
+  }
   let html = `<tr><th>帧</th><th>dx(px)</th><th>dy(px)</th><th>σc(px)</th>`
     + `<th>残差RMS</th><th>状态</th></tr>`;
   const pts = [];
   for (const e of S.estimates) {
-    html += `<tr><td>${e.index}</td><td>${fmt(e.dx, 3)}</td><td>${fmt(e.dy, 3)}</td>`
+    const flagged = anomalyIdx.has(e.index);
+    html += `<tr${flagged ? " class='row-anomaly'" : ""}><td>${e.index}`
+      + (flagged ? " <span class='badge bad'>异常</span>" : "")
+      + `</td><td>${fmt(e.dx, 3)}</td><td>${fmt(e.dy, 3)}</td>`
       + `<td>${fmt(Math.max(e.sigma_cx, e.sigma_cy), 3)}</td>`
       + `<td>${e.residual_rms !== undefined ? fmt(e.residual_rms, 3) : "—"}</td>`
       + `<td>${e.ok ? (e.used ? "参与" : "禁用") : "剔除"}</td></tr>`;
-    if (e.ok) pts.push([e.dx, e.dy, e.used]);
+    if (e.ok) pts.push([e.dx, e.dy, e.used, flagged]);
   }
   tbl.innerHTML = html;
   if (!pts.length) return;
@@ -216,11 +258,18 @@ function renderResiduals() {
   ctx.font = "10px sans-serif";
   ctx.fillText(`dx ${fmt(x0, 1)}~${fmt(x1, 1)} px`, 22, 14);
   ctx.fillText(`dy ${fmt(y0, 1)}~${fmt(y1, 1)} px`, 22, 26);
-  for (const [x, y, used] of pts) {
-    ctx.fillStyle = used ? "#4fc3f7" : "#777";
-    ctx.beginPath();
-    ctx.arc(mx(x), my(y), 4, 0, 7);
-    ctx.fill();
+  for (const [x, y, used, flagged] of pts) {
+    if (flagged) {
+      ctx.fillStyle = "#ef5350";
+      ctx.beginPath();
+      ctx.arc(mx(x), my(y), 6, 0, 7);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = used ? "#4fc3f7" : "#777";
+      ctx.beginPath();
+      ctx.arc(mx(x), my(y), 4, 0, 7);
+      ctx.fill();
+    }
   }
 }
 
@@ -252,6 +301,70 @@ $("view").onchange = (e) => { view = e.target.value; refreshImage(); };
 $("frame-picker").onchange = (e) => { pickFrame = +e.target.value; refreshImage(); };
 for (const id of ["lo", "hi", "logstretch"])
   $(id).onchange = refreshImage;
+
+// ---------------- 离线任务（页面内交互，不依赖 CLI） ----------------
+
+const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
+
+function renderOffline(snap) {
+  const el = $("offline-status");
+  const running = snap && !TERMINAL.has(snap.status);
+  $("btn-offline-cancel").disabled = !running;
+  $("btn-offline-resume").disabled =
+    !(snap && (snap.status === "failed" || snap.status === "cancelled"));
+  if (!snap) { el.textContent = "尚未发起离线任务"; return; }
+  const pct = Math.round((snap.progress || 0) * 100);
+  let txt = `任务 ${snap.job_id}\n状态: ${snap.status}（阶段 ${snap.stage || "-"}，${pct}%）`;
+  if (snap.cancel_requested) txt += "\n已请求取消，等待阶段/帧边界退出…";
+  if (snap.status === "succeeded" && snap.evidence) {
+    const snr = snap.evidence.output_snr;
+    const ms = snap.evidence.frame_manifest_summary;
+    txt += `\n输出信噪比: 孔径 SNR=${fmt(snr.snr_aperture, 2)} 峰值 SNR=${fmt(snr.snr_peak, 2)}`;
+    txt += `\n帧清单: 共 ${ms.n_frames} 帧，参与 ${ms.n_used}，`
+      + `门控剔除 ${ms.n_gated}，坏输入 ${ms.n_bad_input}`;
+    txt += "\n产物已载入下方视图（融合图/覆盖图/残差/星点细节）";
+  }
+  if (snap.error_detail)
+    txt += `\n退出信息: [${snap.error_detail.error_type}] ${snap.error_detail.error}`;
+  else if (snap.error)
+    txt += `\n退出信息: ${snap.error}`;
+  el.textContent = txt;
+  el.className = "mono offline-status " + (snap.status === "succeeded"
+    ? "offline-ok" : (snap.status === "running" ? "offline-run" : "offline-bad"));
+}
+
+async function offlinePoll() {
+  if (!offlineJobId) return;
+  const snap = await api(`/api/offline/status/${offlineJobId}`);
+  renderOffline(snap);
+  if (TERMINAL.has(snap.status)) {
+    clearInterval(offlinePoll);
+    offlinePoll = null;
+    if (snap.status === "succeeded") await refresh();
+  }
+}
+
+$("btn-offline-start").onclick = async () => {
+  const j = await post("/api/offline/start", { reference: S.reference });
+  offlineJobId = j.job_id;
+  renderOffline(j);
+  if (offlinePoll) clearInterval(offlinePoll);
+  offlinePoll = setInterval(offlinePoll, 1000);
+};
+
+$("btn-offline-cancel").onclick = async () => {
+  if (!offlineJobId) return;
+  const j = await post(`/api/offline/cancel/${offlineJobId}`, {});
+  renderOffline(j);
+};
+
+$("btn-offline-resume").onclick = async () => {
+  if (!offlineJobId) return;
+  const j = await post(`/api/offline/resume/${offlineJobId}`, {});
+  renderOffline(j);
+  if (offlinePoll) clearInterval(offlinePoll);
+  offlinePoll = setInterval(offlinePoll, 1000);
+};
 
 async function boot() {
   await refresh();
